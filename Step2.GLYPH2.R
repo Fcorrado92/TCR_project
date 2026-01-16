@@ -24,15 +24,43 @@ T_cells_filt_clono<-subset(T_cells_filt2, cells=keep, final_annotation%in%c("CD8
                                                                             "CD8+KIR+TEM"
                                                                             ))
 
-counts<-as.data.frame(T_cells_filt_clono@meta.data%>%group_by(Final_deID_sampleID)%>%summarise(counts=n_distinct(clonotypeID)))
-T_cells_filt_clono@meta.data<-T_cells_filt_clono@meta.data%>%left_join(counts, by="Final_deID_sampleID")
-sub<-T_cells_filt_clono@meta.data%>%select(c("Final_deID_sampleID", "TRB_cdr3_aa", "TRB_V_gene", "counts"))
+sub<-T_cells_filt_clono@meta.data%>%select(c("Final_deID_sampleID", "TRB_cdr3_aa", "TRB_V_gene"))
+
+#Subject:condition	Subject and condition are delimited with “:”. 
+# Condition can be anything such as tissue type, cell subset or treatment et al.
+# Subject part cannot be empty, must match subject field in input HLA file. Condition part and “:” can be omit.
+sub <- sub %>%
+  mutate(
+    patient = {
+      parts <- str_split(Final_deID_sampleID, "_")
+      sapply(parts, function(p)
+        paste0(
+          p[1],               # P1
+          ":",               
+          p[2],               # PB
+          paste(p[(length(p)-1):length(p)], collapse = "")  # PreSMM
+        )
+      )
+    }
+  )
+
+
+# -------------------------------------------------------------------------
+#Now for each sample count of each single CDR3b
+# -------------------------------------------------------------------------
 sub<-sub%>%filter(!is.na(TRB_cdr3_aa))
 
-colnames(sub)<-c("patient","CDR3b","TRBV", "counts")
-sub <- sub %>% 
-  dplyr::select(CDR3b, dplyr::everything())
+t<-sub%>%group_by(patient, TRB_cdr3_aa)%>%summarise(counts=n())
+sub<-sub%>%left_join(t, by=c("patient", "TRB_cdr3_aa"))
 
+
+# -------------------------------------------------------------------------
+#rename cols
+# -------------------------------------------------------------------------
+sub<-sub%>%select(-c("Final_deID_sampleID"))
+
+
+colnames(sub)<-c("CDR3b","TRBV","patient", "counts")
 
 # -------------------------------------------------------------------------
 #do the same for CAR-T cells
@@ -48,18 +76,100 @@ clono<-subset(endogenous_t_cells, cells=keep, final_annotation%in%c("CD8+GZMB+TE
                                                                             "CD8+Cycling"
 ))
 
-counts2<-as.data.frame(clono@meta.data%>%group_by(Final_deID_sampleID)%>%summarise(counts=n_distinct(clonotypeID)))
-clono@meta.data<-clono@meta.data%>%left_join(counts2, by="Final_deID_sampleID")
-sub2<-clono@meta.data%>%select(c("Final_deID_sampleID", "TRB_cdr3_aa", "TRB_V_gene", "counts"))
+sub2<-clono@meta.data%>%select(c("Final_deID_sampleID", "TRB_cdr3_aa", "TRB_V_gene"))
+
+#sub2ject:condition	sub2ject and condition are delimited with “:”. 
+# Condition can be anything such as tissue type, cell sub2set or treatment et al.
+# sub2ject part cannot be empty, must match sub2ject field in input HLA file. Condition part and “:” can be omit.
+sub2 <- sub2 %>%
+  mutate(
+    patient = {
+      parts <- str_split(Final_deID_sampleID, "_")
+      sapply(parts, function(p)
+        paste0(
+          p[1],               # P1
+          ":",               
+          p[2],               # PB
+          paste(p[(length(p)-1):length(p)], collapse = "")  # PreSMM
+        )
+      )
+    }
+  )
+
+
+# -------------------------------------------------------------------------
+#Now for each sample count of each single CDR3b
+# -------------------------------------------------------------------------
 sub2<-sub2%>%filter(!is.na(TRB_cdr3_aa))
 
-colnames(sub2)<-c("patient","CDR3b","TRBV", "counts")
-sub2 <- sub2 %>% 
-  dplyr::select(CDR3b, dplyr::everything())
+t<-sub2%>%group_by(patient, TRB_cdr3_aa)%>%summarise(counts=n())
+sub2<-sub2%>%left_join(t, by=c("patient", "TRB_cdr3_aa"))
+
+
+# -------------------------------------------------------------------------
+#rename cols
+# -------------------------------------------------------------------------
+sub2<-sub2%>%select(-c("Final_deID_sampleID"))
+
+
+colnames(sub2)<-c("CDR3b","TRBV","patient", "counts")
+
 
 final<-rbind(sub,sub2)
-final_dedup <- final %>%
-  distinct(patient, CDR3b, .keep_all = TRUE)
+
+
+# -------------------------------------------------------------------------
+#Prepare the HLA table
+# -------------------------------------------------------------------------
+library(dplyr)
+library(stringr)
+library(purrr)
+library(jsonlite)
+library(tibble)
+
+# -------------------------
+# 1) helper patient in FINAL
+# -------------------------
+final2 <- final %>%
+  mutate(patient_key = str_extract(patient, "P\\d+"))
+
+# -------------------------
+# 2) build HLA table (one row per P#)
+# -------------------------
+hla_dir <- "~/TCR_project/genotype_jsons"
+keep_loci <- c("A", "B", "C")
+
+files <- list.files(hla_dir, pattern = "\\.json$", full.names = TRUE)
+
+hla_tbl_patient <- map_dfr(files, function(f) {
+  x <- fromJSON(f)
+  # keep only A, B, C
+  x <- x[names(x) %in% keep_loci]
+  patient_key <- str_match(basename(f), "^(P\\d+)")[,2]
+  
+  alleles <- unlist(x, use.names = FALSE) |> as.character()
+  alleles <- alleles[!is.na(alleles) & alleles != ""]
+  alleles <- sort(unique(alleles))
+  
+  tibble(patient_key = patient_key,
+         HLA = paste(alleles, collapse = ","))
+}) %>%
+  group_by(patient_key) %>%                           # if multiple json per patient
+  summarise(
+    HLA = paste(sort(unique(unlist(str_split(HLA, ",")))), collapse = ","),
+    .groups = "drop"
+  )
+
+# -------------------------
+# 3) join + remove helper col
+# -------------------------
+final2 <- final2 %>%
+  left_join(hla_tbl_patient, by = "patient_key") %>%
+  select(-patient_key)
+
+final2
+
+
 
 # -------------------------------------------------------------------------
 # To use **turbo_gliph**, **gliph2** and **gliph_combined**, 
@@ -110,11 +220,12 @@ final_dedup <- final %>%
 # The sequences are simply analyzed by calling the function **turbo_gliph** with the input dataframe as *cdr3_sequences* parameter.
 
 
-sub
 # -------------------------------------------------------------------------
-res_turbogliph <- turboGliph::turbo_gliph(cdr3_sequences = final_dedup,
+final3<-final2%>%filter(!is.na(HLA))
+res_turbogliph <- turboGliph::turbo_gliph(cdr3_sequences = final3, 
                                           n_cores = 8)
+
 saveRDS(res_turbogliph, "~/TCR_project/res_turbogliph.rds")
 plot_network(clustering_output = res_turbogliph,
              n_cores = 1)
-
+write.csv(final3, "~/TCR_project/input_gliph.csv")
