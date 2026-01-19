@@ -75,9 +75,8 @@ total<-meta%>%filter(PT_ID==pt)%>%group_by(Timepoint)%>%summarise(n=n())
 tot_pre<-total$n[2]
 tot_post<-total$n[1]
 
-
-res<-poisson_testing( pre, post) %>% arrange(fdr)%>%
-  mutate(combined_clonotype = sub_wide$combined_clonotype)
+res<-poisson_testing(pre, post)%>%
+  mutate(combined_clonotype = sub_wide$combined_clonotype)%>% arrange(fdr)
 res_list[[pt]] <- res
 
 }
@@ -333,8 +332,9 @@ for(pt in patients){
   tot_post<-total$n[1]
   
   
-  res<-poisson_testing( pre, post) %>% arrange(fdr)%>%
-    mutate(combined_clonotype = sub_wide$combined_clonotype)
+  res<-poisson_testing( pre, post) %>%
+    mutate(combined_clonotype = sub_wide$combined_clonotype)%>%
+    arrange(fdr)
   res_list[[pt]] <- res
   
 }
@@ -501,4 +501,218 @@ ggsave(p_rrmm, filename=paste0(outdir, "clonotype_tracking_rrmm_car.pdf"), width
 
 #save res_df
 write_csv(res_df, paste0(output_dir, "Poisson_CART.csv"))
+res_df<-read_csv( paste0(output_dir, "Poisson_CART.csv"))
+res_df2<-read_csv( paste0(output_dir, "Poisson_TEC.csv"))
+res_df<-rbind(res_df, res_df2)
+res_df <- res_df %>%
+  mutate(
+    category = case_when(
+      sig == TRUE  & freq_post > freq_pre ~ "expanding",
+      sig == TRUE  & freq_post < freq_pre ~ "contracting",
+      sig == FALSE                        ~ "stable",
+      TRUE                                ~ NA_character_
+    )
+  )
 
+
+# -------------------------------------------------------------------------
+#now to understand how many clones are expanding post-treatment
+#left join by PT_ID and clonotype so that each clone pre and post is assigned a category
+#then select only post-treatment samples and perform expanding clones/ total clones
+# -------------------------------------------------------------------------
+T_cells_filt2<-qread("~/Immune_project/data_to_share_CART_TEC/T_cells_nov25_deid.qs")
+
+remove <- unique(rownames(T_cells_filt2@meta.data[is.na(T_cells_filt2@meta.data$clonotypeID), ]))
+keep<-setdiff(unique(rownames(T_cells_filt2@meta.data)), remove)
+T_cells_filt_clono<-subset(T_cells_filt2, cells = keep)
+T_cells_filt_clono@meta.data<-T_cells_filt_clono@meta.data%>%mutate(combined_clonotype = paste(TRA_cdr3_aa, TRB_cdr3_aa, sep="_"),
+                                                                    new_clones=paste0(PT_ID,"_",combined_clonotype)) 
+#take only Diseased, TEC, PB
+T_cells_filt_clono<-subset(T_cells_filt_clono, Therapy=="TEC"&Tissue=="PB")
+paired_ids<-T_cells_filt_clono@meta.data%>%group_by(PT_ID)%>%summarise(n=n_distinct(Timepoint))%>%filter(n>1)%>%pull(PT_ID)
+T_cells_filt_clono<-subset(T_cells_filt_clono, PT_ID%in%paired_ids)
+
+#start with TEC
+res_df<-res_df%>%select(-c("Disease"))
+#assign the label "category" to each clonotype
+T_cells_filt_clono@meta.data<-T_cells_filt_clono@meta.data%>%left_join(res_df, by=c("PT_ID", "combined_clonotype"))
+#select Post only
+post_tec<-T_cells_filt_clono@meta.data%>%filter(Timepoint=="Post")
+
+#percentage of patients with at least one expanding clones
+pt_exp <- post_tec %>%
+  group_by(PT_ID, Disease) %>%
+  summarise(
+    has_expanding = any(category == "expanding" & n() > 0),
+    .groups = "drop"
+  )
+
+# tbl 2x2
+tab <- pt_exp %>%
+  count(Disease, has_expanding) %>%
+  pivot_wider(names_from = has_expanding, values_from = n, values_fill = 0) %>%
+  arrange(Disease)
+
+# matrice per fisher
+mat <- as.matrix(tab[, c("FALSE", "TRUE")])
+rownames(mat) <- tab$Disease
+colnames(mat) <- c("no_expanding", "has_expanding")
+
+mat
+fisher_res <- fisher.test(mat)
+fisher_res
+
+df_mat <- as.data.frame(mat) %>%
+  rownames_to_column("Disease") %>%
+  pivot_longer(
+    cols = c(no_expanding, has_expanding),
+    names_to = "status",
+    values_to = "n")
+
+df_mat_perc <- df_mat %>%
+  group_by(Disease) %>%
+  mutate(
+    perc = n / sum(n) * 100
+  ) %>%
+  ungroup()
+
+df_mat_perc$status <- factor(
+  df_mat_perc$status,
+  levels = c("no_expanding", "has_expanding"),
+  labels = c("Not Expanding", "Expanding")
+)
+
+p<-ggplot(df_mat_perc, aes(x = Disease, y = perc, fill = status)) +
+  geom_bar(
+    stat = "identity",
+    width = 0.7,
+    color = "black"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Not Expanding"    = "lightgrey",
+      "Expanding" = "steelblue"   # oppure "firebrick"
+    )
+  ) +
+  labs(
+    y = "% of Patients",
+    x = NULL
+  ) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    expand = c(0, 0)
+  ) +
+  theme_classic(base_size = 22) +
+  theme(
+    axis.text = element_text(color = "black"),
+    legend.title = element_blank(),
+    legend.position = "bottom"
+  )
+
+ggsave(p, filename="~/TCR_project/plots/n_pts_expanding_TEC.pdf", width=6, height=6)
+
+#number of CD4 and CD8 cells expanding in each post sample
+sub <- post_tec %>%
+  group_by(PT_ID, Disease,lineage, category) %>%
+  summarise(n = n())
+
+#fraction of expanding 
+sub<-sub%>%group_by(PT_ID, lineage)%>%mutate(tot=sum(n), fraction=n/tot)
+
+sub_expanding_cd8 <- sub %>%
+  filter(category == "expanding"&lineage=="CD8") %>%
+  mutate(Disease = factor(Disease, levels = c("HRSMM", "RRMM"))) %>%
+  mutate(jitter_x = as.numeric(Disease) + runif(n(), -0.12, 0.12))
+
+boxplot_plot_final <- ggplot(sub_expanding_cd8, aes(x = Disease, y = fraction * 100, fill = Disease)) +
+  geom_boxplot(width = 0.7, outlier.shape = NA, alpha = 0.7  ) +
+  geom_point(aes(x = jitter_x), fill = "darkgrey", alpha = 0.5,
+             shape = 21, size = 4, stroke = 0.6, color = "black") +
+  geom_pwc(method="wilcox.test", method.args = list(alternative="greater"), label.size=5) +
+  scale_fill_manual(values = c("HRSMM" = "lightgrey", "RRMM" = "gold")) +
+  labs(y = "% of CD8+ T cells", x = NULL, title="Cells in an expanding clone") +
+  theme_classic(base_size = 18) +
+  theme(axis.text = element_text(size = 18, color = "black"),
+        axis.text.x = element_text(size = 13),
+        legend.position = "none")
+
+ggsave(boxplot_plot_final, filename = paste0("~/TCR_project/plots/CD8_expanding.pdf"), width = 6, height = 4)
+
+write_csv(sub, "~/Immune_project/data_to_share_CART_TEC/clonotype_tracking_TEC.csv")
+
+
+# -------------------------------------------------------------------------
+#select T cells in expanding clones 
+# -------------------------------------------------------------------------
+
+post_tec_exp <- post_tec %>%
+  filter(category == "expanding") %>%
+  count(PT_ID, final_annotation, name = "n")   # equivalente a group_by+summarise(n=n())
+
+# lista completa delle annotazioni da includere (coerente su tutti i PT)
+all_ann <- sort(unique(post_tec_exp$final_annotation))  # oppure unique(post_tec_exp$final_annotation)
+
+post_tec_exp <- post_tec_exp %>%
+  complete(
+    PT_ID,
+    final_annotation = all_ann,
+    fill = list(n = 0)
+  )
+pt_disease <- post_tec %>%
+  distinct(PT_ID, Disease)
+
+post_tec_exp <- post_tec_exp %>%
+  left_join(pt_disease, by = "PT_ID")
+
+post_tec_exp <- post_tec_exp %>%
+  group_by(PT_ID) %>%
+  mutate(
+    total = sum(n),
+    fraction = ifelse(total > 0, n / total, 0)
+  ) %>%
+  ungroup()
+
+mat <- post_tec_exp %>%
+  select(PT_ID, final_annotation, fraction) %>%
+  pivot_wider(names_from = final_annotation, values_from = fraction) %>%
+  column_to_rownames("PT_ID") %>%
+  as.matrix()
+
+# 2) annotation_row con Disease
+ann_row <- post_tec_exp %>%
+  distinct(PT_ID, Disease) %>%
+  column_to_rownames("PT_ID")
+
+# allinea all'ordine delle righe di mat
+ann_row <- ann_row[rownames(mat), , drop = FALSE]
+
+# 3) ordina righe per Disease (es. HRSMM sopra, RRMM sotto)
+ord <- order(ann_row$Disease)
+mat <- mat[ord, , drop = FALSE]
+ann_row <- ann_row[ord, , drop = FALSE]
+
+# 4) colori Disease
+ann_colors <- list(
+  Disease = c(
+    HRSMM = "grey70",
+    RRMM  = "gold"
+  )
+)
+
+# 5) heatmap
+pheatmap(
+  mat,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  annotation_row = ann_row,
+  annotation_colors = ann_colors,
+  border_color = NA,
+  fontsize_row = 8,
+  fontsize_col = 10
+)
+
+
+# -------------------------------------------------------------------------
+#For each patient calculate the percentage of expanding cells in each phenotype
+# -------------------------------------------------------------------------
+ggplot(post_tec_exp, aes(x=final_annotation, y=fraction))+geom_point()+geom_boxplot()
